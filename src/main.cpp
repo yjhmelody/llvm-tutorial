@@ -1,6 +1,15 @@
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IR/Module.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -115,17 +124,8 @@ class NumberExprAST : public ExprAST
 
   public:
     NumberExprAST(double Val) : Val(Val) {}
-    virtual Value *codegen();
+    Value *codegen() override;
 };
-// In the LLVM IR, numeric constants are represented with the ConstantFP class,
-// which holds the numeric value in an APFloat internally (APFloat has the capability
-// of holding floating point constants of Arbitrary Precision). This code basically just
-// creates and returns a ConstantFP. Note that in the LLVM IR that constants are all uniqued together and shared.
-// For this reason, the API uses the “foo::get(…)” idiom instead of “new foo(..)” or “foo::Create(..)”.
-Value *NumberExprAST::codegen()
-{
-    return ConstantFP::get(TheContext, APFloat(Val));
-}
 
 /// VariableExprAST - Expression class for referencing a variable, like "a".
 class VariableExprAST : public ExprAST
@@ -134,24 +134,8 @@ class VariableExprAST : public ExprAST
 
   public:
     VariableExprAST(const std::string &Name) : Name(Name) {}
-    virtual Value *codegen();
+    Value *codegen() override;
 };
-
-// References to variables are also quite simple using LLVM. In the simple version of Kaleidoscope,
-// we assume that the variable has already been emitted somewhere and its value is available.
-// In practice, the only values that can be in the NamedValues map are function arguments.
-// This code simply checks to see that the specified name is in the map (if not, an unknown
-// variable is being referenced) and returns the value for it. In future chapters,
-// we’ll add support for `loop induction variables` in the symbol table, and for `local variables`.
-Value *VariableExprAST::codegen()
-{
-    Value *V = NamedValued[Name];
-    if (V == nullptr)
-    {
-        LogErrorV("unknow variable name");
-    }
-    return V;
-}
 
 /// BinaryExprAST - Expression class for a binary operator.
 class BinaryExprAST : public ExprAST
@@ -163,57 +147,8 @@ class BinaryExprAST : public ExprAST
     BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
                   std::unique_ptr<ExprAST> RHS)
         : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
-    virtual Value *codegen();
+    Value *codegen() override;
 };
-
-// Binary operators start to get more interesting. The basic idea here is that
-// we recursively emit code for the left-hand side of the expression, then the
-// right-hand side, then we compute the result of the binary expression. In this code,
-// we do a simple switch on the opcode to create the right LLVM instruction.
-
-// One nice thing about LLVM is that the name is just a hint. For instance, if the code
-// above emits multiple “addtmp” variables, LLVM will automatically provide each one with
-// an increasing, unique numeric suffix. Local value names for instructions are purely optional,
-// but it makes it much easier to read the IR dumps.
-
-// LLVM instructions are constrained by strict rules: for example, the Left and Right operators of
-// an add instruction must have the same type, and the result type of the add must match the operand types.
-// Because all values in Kaleidoscope are doubles, this makes for very simple code for add, sub and mul.
-
-// On the other hand, LLVM specifies that the fcmp instruction always returns an ‘i1’ value
-// (a one bit integer). The problem with this is that Kaleidoscope wants the value to be a 0.0 or 1.0 value.
-// In order to get these semantics, we combine the fcmp instruction with a uitofp instruction.
-// This instruction converts its input integer into a floating point value by treating the input as an unsigned value.
-// In contrast, if we used the sitofp instruction, the Kaleidoscope ‘<’ operator would return 0.0 and -1.0,
-// depending on the input value.
-Value *BinaryExprAST::codegen()
-{
-    Value *L = this->LHS->codegen();
-    Value *R = this->RHS->codegen();
-    if (!L || !R)
-    {
-        return nullptr;
-    }
-
-    switch (this->Op)
-    {
-    case '+':
-        return Builder.CreateAdd(L, R, "addtmp");
-    case '-':
-        return Builder.CreateSub(L, R, "subtmp");
-    case '*':
-        return Builder.CreateMul(L, R, "multmp");
-    case '/':
-        return Builder.CreateFDiv(L, R, "fdivtmp");
-    case '<':
-        L = Builder.CreateFCmpULT(L, R, "cmptmp");
-        // Convert bool 0/1 to double 0.0 or 1.0
-        return Builder.CreateUIToFP(L, Type::getDoubleTy(TheContext), "booltmp");
-
-    default:
-        return LogErrorV("invalid binary operator");
-    }
-}
 
 /// CallExprAST - Expression class for function calls.
 class CallExprAST : public ExprAST
@@ -228,48 +163,8 @@ class CallExprAST : public ExprAST
                 std::vector<std::unique_ptr<ExprAST>> Args)
         : Callee(Callee), Args(std::move(Args)) {}
 
-    virtual Value *codegen();
+    Value *codegen() override;
 };
-
-// Code generation for function calls is quite straightforward with LLVM. The code above initially 
-// does a function name lookup in the LLVM Module’s symbol table. Recall that the LLVM Module is 
-// the container that holds the functions we are JIT’ing. By giving each function the same name as what 
-// the user specifies, we can use the LLVM symbol table to resolve function names for us.
-
-// Once we have the function to call, we recursively codegen each argument that is to be passed in, 
-// and create an LLVM call instruction. Note that LLVM uses the native C calling conventions by default, 
-// allowing these calls to also call into standard library functions like “sin” and “cos”, with no additional effort.
-
-// This wraps up our handling of the four basic expressions that we have so far in Kaleidoscope. 
-// Feel free to go in and add some more. For example, by browsing the LLVM language reference you’ll 
-// find several other interesting instructions that are really easy to plug into our basic framework.
-Value *CallExprAST::codegen()
-{
-    // Look up the name in the global module table.
-    Function *CalleeF = TheModule->getFunction(this->Callee);
-    if (CalleeF == nullptr)
-    {
-        return LogErrorV("Unknown function referenced");
-    }
-    // If argument mismatch error.
-    if (CalleeF->arg_size() != this->Args.size())
-    {
-        return LogErrorV("Incorrect # arguments passed");
-    }
-
-    std::vector<Value *> ArgsV;
-    for (unsigned i = 0, e = Args.size(); i != e; i++)
-    {
-        // Args[i] are exprAST
-        ArgsV.push_back(this->Args[i]->codegen());
-        if (Args.back() == nullptr)
-        {
-            return nullptr;
-        }
-    }
-
-    return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
-}
 
 /// PrototypeAST - This class represents the "prototype" for a function,
 /// which captures its name, and its argument names (thus implicitly the number
@@ -287,6 +182,7 @@ class PrototypeAST
     {
         return Name;
     }
+    Function *codegen();
 };
 
 /// FunctionAST - This class represents a function definition itself.
@@ -298,6 +194,8 @@ class FunctionAST
   public:
     FunctionAST(std::unique_ptr<PrototypeAST> Proto, std::unique_ptr<ExprAST> Body)
         : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+    Function *codegen();
 };
 
 // In Kaleidoscope, functions are typed with just a count of their arguments.
@@ -351,34 +249,6 @@ std::unique_ptr<ExprAST> LogError(const char *Str)
     return nullptr;
 }
 std::unique_ptr<PrototypeAST> LogErrorP(const char *Str)
-{
-    LogError(Str);
-    return nullptr;
-}
-
-// TheContext is an opaque object that owns a lot of core LLVM data structures,
-// such as the type and constant value tables. We don’t need to understand it in detail,
-// we just need a single instance to pass into APIs that require it.
-static LLVMContext TheContext;
-// The Builder object is a helper object that makes it easy to generate LLVM instructions.
-// Instances of the IRBuilder class template keep track of the current place to insert
-// instructions and has methods to create new instructions.
-static IRBuilder<> Builder(TheContext);
-// TheModule is an LLVM construct that contains functions and global variables.
-// In many ways, it is the top-level structure that the LLVM IR uses to contain code.
-// It will own the memory for all of the IR that we generate, which is why the
-// codegen() method returns a raw Value*, rather than a unique_ptr<Value>.
-static std::unique_ptr<Module> TheModule;
-// The NamedValues map keeps track of which values are defined in the current scope
-// and what their LLVM representation is. (In other words, it is a symbol table for the code).
-// In this form of Kaleidoscope, the only things that can be referenced are function parameters.
-// As such, function parameters will be in this map when generating code for their function body.
-static std::map<std::string, Value *> NamedValued;
-// With these basics in place, we can start talking about how to generate code for each expression.
-// Note that this assumes that the Builder has been set up to generate code into something.
-// For now, we’ll assume that this has already been done, and we’ll just use it to emit code.
-
-Value *LogErrorV(const char *Str)
 {
     LogError(Str);
     return nullptr;
@@ -606,6 +476,276 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
 }
 
 //===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+// TheContext is an opaque object that owns a lot of core LLVM data structures,
+// such as the type and constant value tables. We don’t need to understand it in detail,
+// we just need a single instance to pass into APIs that require it.
+static LLVMContext TheContext;
+// The Builder object is a helper object that makes it easy to generate LLVM instructions.
+// Instances of the IRBuilder class template keep track of the current place to insert
+// instructions and has methods to create new instructions.
+static IRBuilder<> Builder(TheContext);
+// TheModule is an LLVM construct that contains functions and global variables.
+// In many ways, it is the top-level structure that the LLVM IR uses to contain code.
+// It will own the memory for all of the IR that we generate, which is why the
+// codegen() method returns a raw Value*, rather than a unique_ptr<Value>.
+static std::unique_ptr<Module> TheModule;
+// The NamedValues map keeps track of which values are defined in the current scope
+// and what their LLVM representation is. (In other words, it is a symbol table for the code).
+// In this form of Kaleidoscope, the only things that can be referenced are function parameters.
+// As such, function parameters will be in this map when generating code for their function body.
+static std::map<std::string, Value *> NamedValues;
+// With these basics in place, we can start talking about how to generate code for each expression.
+// Note that this assumes that the Builder has been set up to generate code into something.
+// For now, we’ll assume that this has already been done, and we’ll just use it to emit code.
+Value *LogErrorV(const char *Str)
+{
+    LogError(Str);
+    return nullptr;
+}
+
+// In the LLVM IR, numeric constants are represented with the ConstantFP class,
+// which holds the numeric value in an APFloat internally (APFloat has the capability
+// of holding floating point constants of Arbitrary Precision). This code basically just
+// creates and returns a ConstantFP. Note that in the LLVM IR that constants are all uniqued together and shared.
+// For this reason, the API uses the “foo::get(…)” idiom instead of “new foo(..)” or “foo::Create(..)”.
+Value *NumberExprAST::codegen()
+{
+    return ConstantFP::get(TheContext, APFloat(Val));
+}
+
+// References to variables are also quite simple using LLVM. In the simple version of Kaleidoscope,
+// we assume that the variable has already been emitted somewhere and its value is available.
+// In practice, the only values that can be in the NamedValues map are function arguments.
+// This code simply checks to see that the specified name is in the map (if not, an unknown
+// variable is being referenced) and returns the value for it. In future chapters,
+// we’ll add support for `loop induction variables` in the symbol table, and for `local variables`.
+Value *VariableExprAST::codegen()
+{
+    Value *V = NamedValues[Name];
+    if (V == nullptr)
+    {
+        LogErrorV("unknow variable name");
+    }
+    return V;
+}
+
+// Binary operators start to get more interesting. The basic idea here is that
+// we recursively emit code for the left-hand side of the expression, then the
+// right-hand side, then we compute the result of the binary expression. In this code,
+// we do a simple switch on the opcode to create the right LLVM instruction.
+
+// One nice thing about LLVM is that the name is just a hint. For instance, if the code
+// above emits multiple “addtmp” variables, LLVM will automatically provide each one with
+// an increasing, unique numeric suffix. Local value names for instructions are purely optional,
+// but it makes it much easier to read the IR dumps.
+
+// LLVM instructions are constrained by strict rules: for example, the Left and Right operators of
+// an add instruction must have the same type, and the result type of the add must match the operand types.
+// Because all values in Kaleidoscope are doubles, this makes for very simple code for add, sub and mul.
+
+// On the other hand, LLVM specifies that the fcmp instruction always returns an ‘i1’ value
+// (a one bit integer). The problem with this is that Kaleidoscope wants the value to be a 0.0 or 1.0 value.
+// In order to get these semantics, we combine the fcmp instruction with a uitofp instruction.
+// This instruction converts its input integer into a floating point value by treating the input as an unsigned value.
+// In contrast, if we used the sitofp instruction, the Kaleidoscope ‘<’ operator would return 0.0 and -1.0,
+// depending on the input value.
+Value *BinaryExprAST::codegen()
+{
+    Value *L = this->LHS->codegen();
+    Value *R = this->RHS->codegen();
+    if (!L || !R)
+    {
+        return nullptr;
+    }
+
+    switch (this->Op)
+    {
+    case '+':
+        return Builder.CreateAdd(L, R, "addtmp");
+    case '-':
+        return Builder.CreateSub(L, R, "subtmp");
+    case '*':
+        return Builder.CreateMul(L, R, "multmp");
+    case '/':
+        return Builder.CreateFDiv(L, R, "fdivtmp");
+    case '<':
+        L = Builder.CreateFCmpULT(L, R, "cmptmp");
+        // Convert bool 0/1 to double 0.0 or 1.0
+        return Builder.CreateUIToFP(L, Type::getDoubleTy(TheContext), "booltmp");
+
+    default:
+        return LogErrorV("invalid binary operator");
+    }
+}
+
+// Code generation for function calls is quite straightforward with LLVM. The code above initially
+// does a function name lookup in the LLVM Module’s symbol table. Recall that the LLVM Module is
+// the container that holds the functions we are JIT’ing. By giving each function the same name as what
+// the user specifies, we can use the LLVM symbol table to resolve function names for us.
+
+// Once we have the function to call, we recursively codegen each argument that is to be passed in,
+// and create an LLVM call instruction. Note that LLVM uses the native C calling conventions by default,
+// allowing these calls to also call into standard library functions like “sin” and “cos”, with no additional effort.
+
+// This wraps up our handling of the four basic expressions that we have so far in Kaleidoscope.
+// Feel free to go in and add some more. For example, by browsing the LLVM language reference you’ll
+// find several other interesting instructions that are really easy to plug into our basic framework.
+Value *CallExprAST::codegen()
+{
+    // Look up the name in the global module table.
+    Function *CalleeF = TheModule->getFunction(this->Callee);
+    if (CalleeF == nullptr)
+    {
+        return LogErrorV("Unknown function referenced");
+    }
+    // If argument mismatch error.
+    if (CalleeF->arg_size() != this->Args.size())
+    {
+        return LogErrorV("Incorrect # arguments passed");
+    }
+
+    std::vector<Value *> ArgsV;
+    for (unsigned i = 0, e = Args.size(); i != e; i++)
+    {
+        // Args[i] are exprAST
+        ArgsV.push_back(this->Args[i]->codegen());
+        if (Args.back() == nullptr)
+        {
+            return nullptr;
+        }
+    }
+
+    return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+// This code packs a lot of power into a few lines. Note first that this function returns a “Function*”
+// instead of a “Value*”. Because a “prototype” really talks about the external interface for a function
+// (not the value computed by an expression), it makes sense for it to return the LLVM Function it
+// corresponds to when codegen’d.
+
+// The call to FunctionType::get creates the FunctionType that should be used for a given Prototype.
+// Since all function arguments in Kaleidoscope are of type double, the first line creates a vector
+// of “N” LLVM double types. It then uses the Functiontype::get method to create a function type that
+// takes “N” doubles as arguments, returns one double as a result, and that is not vararg
+// (the false parameter indicates this). Note that Types in LLVM are uniqued just like Constants are,
+// so you don’t “new” a type, you “get” it.
+
+// The final line above actually creates the IR Function corresponding to the Prototype.
+// This indicates the type, linkage and name to use, as well as which module to insert into.
+// “external linkage” means that the function may be defined outside the current module and/or that
+// it is callable by functions outside the module. The Name passed in is the name the user specified:
+// since “TheModule” is specified, this name is registered in “TheModule”s symbol table.
+
+// Finally, we set the name of each of the function’s arguments according to the names given in the Prototype.
+// This step isn’t strictly necessary, but keeping the names consistent makes the IR more readable,
+// and allows subsequent code to refer directly to the arguments for their names, rather than having to
+// look up them up in the Prototype AST.
+
+// At this point we have a function prototype with no body. This is how LLVM IR represents function declarations.
+// For extern statements in Kaleidoscope, this is as far as we need to go. For function definitions however,
+// we need to codegen and attach a function body.
+Function *PrototypeAST::codegen()
+{
+    std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(TheContext));
+
+    FunctionType *FT = FunctionType::get(Type::getDoubleTy(TheContext), Doubles, false);
+
+    Function *F = Function::Create(FT, Function::ExternalLinkage, this->Name, TheModule.get());
+
+    // Set names for all arguments.
+    unsigned Idx = 0;
+    for (auto &Arg : F->args())
+    {
+        Arg.setName(Args[Idx++]);
+    }
+
+    return F;
+}
+
+// For function definitions, we start by searching TheModule’s symbol table for an existing version
+// of this function, in case one has already been created using an ‘extern’ statement.
+// If Module::getFunction returns null then no previous version exists, so we’ll codegen one
+// from the Prototype. In either case, we want to assert that the function is empty (i.e. has no body yet) before we start.
+
+// Now we get to the point where the Builder is set up. The first line creates a new basic block (named “entry”),
+// which is inserted into TheFunction. The second line then tells the builder that new instructions should be
+// inserted into the end of the new basic block. Basic blocks in LLVM are an important part of functions
+// that define the Control Flow Graph. Since we don’t have any control flow, our functions will only contain
+// one block at this point. We’ll fix this in Chapter 5 :).
+
+// Once the insertion point has been set up and the NamedValues map populated, we call the codegen() method
+// for the root expression of the function. If no error happens, this emits code to compute the expression
+// into the entry block and returns the value that was computed. Assuming no error, we then create an LLVM
+// ret instruction, which completes the function. Once the function is built, we call verifyFunction,
+// which is provided by LLVM. This function does a variety of consistency checks on the generated code,
+// to determine if our compiler is doing everything right. Using this is important: it can catch a lot of bugs.
+// Once the function is finished and validated, we return it.
+Function *FunctionAST::codegen()
+{
+    // First, check for an existing function from a previous 'extern' declaration.
+    Function *TheFunction = TheModule->getFunction(this->Proto->getName());
+
+    if (TheFunction == nullptr)
+    {
+        TheFunction = Proto->codegen();
+    }
+
+    if (TheFunction == nullptr)
+    {
+        return nullptr;
+    }
+
+    if (!TheFunction->empty())
+    {
+        return (Function *)LogErrorV("Function cannot be redefined.");
+    }
+
+    // Create a new basic block to start insertion into.
+    BasicBlock *BB = BasicBlock::Create(TheContext, "entry", TheFunction);
+    Builder.SetInsertPoint(BB);
+
+    // Record the function arguments in the NamedValues map.
+    NamedValues.clear();
+    for (auto &Arg : TheFunction->args())
+    {
+        NamedValues[Arg.getName()] = &Arg;
+    }
+
+    if (Value *RetVal = this->Body->codegen())
+    {
+        // Finish off the function
+        Builder.CreateRet(RetVal);
+
+        // Validate the generated code, checking for consistency.
+        verifyFunction(*TheFunction);
+
+        return TheFunction;
+    }
+
+    // Error reading body, remove function.
+
+    // The only piece left here is handling of the error case. For simplicity,
+    // we handle this by merely deleting the function we produced with the
+    // eraseFromParent method. This allows the user to redefine a function
+    // that they incorrectly typed in before: if we didn’t delete it, it would
+    // live in the symbol table, with a body, preventing future redefinition.
+    TheFunction->eraseFromParent();
+    return nullptr;
+
+    // This code does have a bug, though: If the FunctionAST::codegen() method finds an existing IR Function,
+    // it does not validate its signature against the definition’s own prototype. This means that an earlier
+    // ‘extern’ declaration will take precedence over the function definition’s signature,
+    // which can cause codegen to fail, for instance if the function arguments are named differently.
+    // There are a number of ways to fix this bug, see what you can come up with! Here is a testcase:
+
+    // extern foo(a);     # ok, defines foo.
+    // def foo(b) b;      # Error: Unknown variable name. (decl using 'a' takes precedence).
+}
+
+//===----------------------------------------------------------------------===//
 // Top-Level parsing
 //===----------------------------------------------------------------------===//
 
@@ -641,22 +781,32 @@ static void MainLoop()
 
 static void HandleDefinition()
 {
-    if (ParseDefinition())
+    if (auto FnAST = ParseDefinition())
     {
-        fprintf(stderr, "Parsed a function defintion.\n");
+        if (auto *FnIR = FnAST->codegen())
+        {
+            fprintf(stderr, "Read function definition:");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     }
     else
     {
-        // Skip token for error recovery;
+        // Skip token for error recovery.
         getNextToken();
     }
 }
 
 static void HandleExtern()
 {
-    if (ParseExtern())
+    if (auto ProtoAST = ParseExtern())
     {
-        fprintf(stderr, "Parsed an extern\n");
+        if (auto *FnIR = ProtoAST->codegen())
+        {
+            fprintf(stderr, "Read extern: ");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     }
     else
     {
@@ -667,13 +817,19 @@ static void HandleExtern()
 
 static void HandleTopLevelExpression()
 {
-    if (ParseTopLevelExpr())
+    // Evaluate a top-level expression into an anonymous function.
+    if (auto FnAST = ParseTopLevelExpr())
     {
-        fprintf(stderr, "Parsed a top-level expr\n");
+        if (auto *FnIR = FnAST->codegen())
+        {
+            fprintf(stderr, "Read top-level expression:");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     }
     else
     {
-        // Skip token for error recovery;
+        // Skip token for error recovery.
         getNextToken();
     }
 }
@@ -706,8 +862,14 @@ int main()
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    // Make the module, which holds all the code.
+    TheModule = llvm::make_unique<Module>("my cool jit", TheContext);
+
     // Run the main "interpreter loop" now.
     MainLoop();
+
+    // Print out all of the generated code.
+    TheModule->print(errs(), nullptr);
 
     return 0;
 }
